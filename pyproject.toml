@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "greenhouse-data-sdk"
+version = "0.1.0"
+description = "Scoped Corporate Database access for Greenhouse Python applications"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.28.1,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
