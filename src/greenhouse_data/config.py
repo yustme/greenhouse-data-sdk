@@ -13,3 +13,6 @@ class ClientSettings:
             raise ValueError("timeout_seconds must be positive and finite")
         if not math.isfinite(self.refresh_margin_seconds) or self.refresh_margin_seconds < 0:
             raise ValueError("refresh_margin_seconds must be nonnegative and finite")
+
+# Protocol metadata carries a signed, host-bound app session, never an asserted email.
+USER_SESSION_HEADER = "X-Greenhouse-User-Session"

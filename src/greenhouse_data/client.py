@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .config import ClientSettings
+from .config import ClientSettings, USER_SESSION_HEADER
 
 _PACKAGE = re.compile(r"^[a-z][a-z0-9-]*$")
 _TABLE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -30,6 +30,15 @@ class _Token:
 
 
 class CorporateClient:
+    """Pass user_session from the current app request to attribute operations to its user.
+
+    For a secure Greenhouse deployment, the backend reads the HttpOnly
+    __Host-greenhouse_app cookie. Never keep a user's cookie on a shared client:
+    data.update(package, table, values, where,
+                user_session=request.cookies.get("__Host-greenhouse_app"))
+    The API verifies the signature, the app host and the user's current account.
+    Background jobs omit user_session and remain attributed to the app itself.
+    """
     def __init__(self, api_url: str, service_token: str, *, settings: ClientSettings | None = None) -> None:
         parts = urlsplit(api_url)
         if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
@@ -62,9 +71,12 @@ class CorporateClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, token: str, **kwargs: Any) -> Any:
+    def _request(self, method: str, path: str, token: str, *, user_session: str | None = None, **kwargs: Any) -> Any:
+        headers = {"Authorization": "Bearer " + token}
+        if user_session is not None:
+            headers[USER_SESSION_HEADER] = user_session
         try:
-            response = self._http.request(method, self._api_url + path, headers={"Authorization": "Bearer " + token}, **kwargs)
+            response = self._http.request(method, self._api_url + path, headers=headers, **kwargs)
         except httpx.RequestError:
             raise CorporateError("Corporate API could not be reached; check the API address and network. Writes are not automatically retried.") from None
         if not response.is_success:
@@ -73,7 +85,9 @@ class CorporateClient:
             except (ValueError, AttributeError):
                 detail = None
             message = detail if isinstance(detail, str) else "Corporate API request failed"
-            for secret in [self._service_token, token]:
+            for secret in [self._service_token, token, user_session]:
+                if not secret:
+                    continue
                 message = message.replace(secret, "[redacted]")
             hint = {401: "The credential expired or was revoked.", 403: "This operation is not shared with the app.",
                     404: "The package, table or requested permission is unavailable to the app.",
@@ -104,7 +118,10 @@ class CorporateClient:
             self._tokens[key] = _Token(token, expires)
             return token
 
-    def _data(self, package: str, table: str | None, operation: str, payload: dict[str, Any] | None = None) -> Any:
+    def _data(self, package: str, table: str | None, operation: str, payload: dict[str, Any] | None = None, *, user_session: str | None = None) -> Any:
+        # Identity is per operation, never cached or stored on a shared client.
+        if user_session is not None and (not isinstance(user_session, str) or not user_session.strip() or "\r" in user_session or "\n" in user_session):
+            raise ValueError("User session must be a nonempty signed app session without line breaks")
         if table is not None and not _TABLE.fullmatch(table):
             raise ValueError("Invalid table name")
         permission = {"tables": "read", "read": "read", "insert": "write", "update": "write", "delete": "delete"}[operation]
@@ -113,17 +130,17 @@ class CorporateClient:
         method = "GET" if table is None else "POST"
         kwargs = {} if table is None else {"json": payload}
         try:
-            return self._request(method, path, token, **kwargs)
+            return self._request(method, path, token, user_session=user_session, **kwargs)
         except CorporateError as exc:
             if exc.status_code != 401:
                 raise
         # A 401 is rejected before the server executes a row operation. Never retry network
         # failures, server failures or forbidden operations, which could duplicate writes.
         token = self._token(package, permission, refresh=True)
-        return self._request(method, path, token, **kwargs)
+        return self._request(method, path, token, user_session=user_session, **kwargs)
 
-    def tables(self, package: str) -> list[dict[str, Any]]:
-        result = self._data(package, None, "tables")
+    def tables(self, package: str, *, user_session: str | None = None) -> list[dict[str, Any]]:
+        result = self._data(package, None, "tables", user_session=user_session)
         if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
             raise CorporateError("Corporate API returned invalid table metadata")
         return result
@@ -140,7 +157,7 @@ class CorporateClient:
         return count
 
     def read(self, package: str, table: str, *, columns: Sequence[str] | None = None, where: dict[str, Any] | None = None,
-             limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
+             limit: int | None = None, offset: int = 0, user_session: str | None = None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"offset": offset}
         if columns is not None:
             payload["columns"] = list(columns)
@@ -148,17 +165,17 @@ class CorporateClient:
             payload["where"] = where
         if limit is not None:
             payload["limit"] = limit
-        return self._row_result(self._data(package, table, "read", payload))
+        return self._row_result(self._data(package, table, "read", payload, user_session=user_session))
 
-    def insert(self, package: str, table: str, rows: Sequence[dict[str, Any]]) -> int:
-        return self._count_result(self._data(package, table, "insert", {"rows": list(rows)}))
+    def insert(self, package: str, table: str, rows: Sequence[dict[str, Any]], *, user_session: str | None = None) -> int:
+        return self._count_result(self._data(package, table, "insert", {"rows": list(rows)}, user_session=user_session))
 
-    def update(self, package: str, table: str, values: dict[str, Any], where: dict[str, Any]) -> int:
+    def update(self, package: str, table: str, values: dict[str, Any], where: dict[str, Any], *, user_session: str | None = None) -> int:
         if not values or not where:
             raise ValueError("Update requires values and a nonempty equality filter")
-        return self._count_result(self._data(package, table, "update", {"values": values, "where": where}))
+        return self._count_result(self._data(package, table, "update", {"values": values, "where": where}, user_session=user_session))
 
-    def delete(self, package: str, table: str, where: dict[str, Any]) -> int:
+    def delete(self, package: str, table: str, where: dict[str, Any], *, user_session: str | None = None) -> int:
         if not where:
             raise ValueError("Delete requires a nonempty equality filter")
-        return self._count_result(self._data(package, table, "delete", {"where": where}))
+        return self._count_result(self._data(package, table, "delete", {"where": where}, user_session=user_session))

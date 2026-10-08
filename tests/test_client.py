@@ -28,7 +28,7 @@ def endpoint():
             self.respond()
         def respond(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("Authorization"), "body": json.loads(body) if body else None})
+            requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("Authorization"), "user_session": self.headers.get("X-Greenhouse-User-Session"), "body": json.loads(body) if body else None})
             if self.path.endswith("/access/token"):
                 answer = {"token": f"scope-{len(requests)}", "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                 status = 200
@@ -211,4 +211,46 @@ def test_empty_mutation_filters_rejected_without_network(endpoint):
             client.update("finance", "entries", {}, {"id": 1})
         with pytest.raises(ValueError):
             client.delete("finance", "entries", {})
+    assert requests == []
+
+
+def test_user_session_is_per_operation_and_never_sent_to_exchange(endpoint):
+    url, requests, responses = endpoint
+    responses.extend([(200, {"affected_rows": 1}), (200, {"affected_rows": 1}), (200, {"affected_rows": 1})])
+    with CorporateClient(url, SERVICE) as client:
+        client.insert("finance", "entries", [{"id": 1}], user_session="signed-user-a")
+        client.update("finance", "entries", {"id": 2}, {"id": 1}, user_session="signed-user-b")
+        client.delete("finance", "entries", {"id": 2})
+    exchanges = [r for r in requests if r["path"].endswith("/access/token")]
+    assert all(r["user_session"] is None for r in exchanges)
+    data = [r for r in requests if not r["path"].endswith("/access/token")]
+    assert [r["user_session"] for r in data] == ["signed-user-a", "signed-user-b", None]
+
+
+def test_user_session_read_and_tables(endpoint):
+    url, requests, responses = endpoint
+    responses.extend([(200, []), (200, {"rows": []})])
+    with CorporateClient(url, SERVICE) as client:
+        assert client.tables("finance", user_session="signed-user") == []
+        assert client.read("finance", "entries", user_session="signed-user") == []
+    assert [r["user_session"] for r in requests] == [None, "signed-user", "signed-user"]
+
+
+def test_user_session_redacted_from_errors_and_preserved_on_auth_retry(endpoint):
+    url, requests, responses = endpoint
+    responses.extend([(401, {"detail": "expired signed-user"}), (401, {"detail": "invalid signed-user"})])
+    with CorporateClient(url, SERVICE) as client:
+        with pytest.raises(CorporateError) as rejected:
+            client.insert("finance", "entries", [{"id": 1}], user_session="signed-user")
+    assert "signed-user" not in str(rejected.value)
+    data = [r for r in requests if not r["path"].endswith("/access/token")]
+    assert [r["user_session"] for r in data] == ["signed-user", "signed-user"]
+
+
+@pytest.mark.parametrize("session", ["", " ", "abc\n", "abc\r", 123])
+def test_invalid_user_session_rejected_before_network(endpoint, session):
+    url, requests, responses = endpoint
+    with CorporateClient(url, SERVICE) as client:
+        with pytest.raises(ValueError):
+            client.read("finance", "entries", user_session=session)
     assert requests == []
