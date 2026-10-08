@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
+import uuid
+from importlib.metadata import version
 import re
 import threading
 from typing import Any, Mapping, Sequence
@@ -11,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .config import ClientSettings, USER_SESSION_HEADER
+from .config import ClientSettings, USER_SESSION_HEADER, SDK_VERSION_HEADER, SDK_VERIFICATION_HEADER
 
 _PACKAGE = re.compile(r"^[a-z][a-z0-9-]*$")
 _TABLE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -71,8 +73,12 @@ class CorporateClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, token: str, *, user_session: str | None = None, **kwargs: Any) -> Any:
+    def _request(self, method: str, path: str, token: str, *, user_session: str | None = None, verification_id: str | None = None, **kwargs: Any) -> Any:
         headers = {"Authorization": "Bearer " + token}
+        if path.startswith("/data/"):
+            headers[SDK_VERSION_HEADER] = version("greenhouse-data-sdk")
+            if verification_id is not None:
+                headers[SDK_VERIFICATION_HEADER] = verification_id
         if user_session is not None:
             headers[USER_SESSION_HEADER] = user_session
         try:
@@ -118,7 +124,14 @@ class CorporateClient:
             self._tokens[key] = _Token(token, expires)
             return token
 
-    def _data(self, package: str, table: str | None, operation: str, payload: dict[str, Any] | None = None, *, user_session: str | None = None) -> Any:
+    def _data(self, package: str, table: str | None, operation: str, payload: dict[str, Any] | None = None, *, user_session: str | None = None, verification_id: str | None = None) -> Any:
+        # Deployment verification identifiers are per request, never shared between clients.
+        if verification_id is not None:
+            try:
+                if str(uuid.UUID(verification_id)) != verification_id:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError("Verification ID must be a canonical UUID") from None
         # Identity is per operation, never cached or stored on a shared client.
         if user_session is not None and (not isinstance(user_session, str) or not user_session.strip() or "\r" in user_session or "\n" in user_session):
             raise ValueError("User session must be a nonempty signed app session without line breaks")
@@ -130,17 +143,17 @@ class CorporateClient:
         method = "GET" if table is None else "POST"
         kwargs = {} if table is None else {"json": payload}
         try:
-            return self._request(method, path, token, user_session=user_session, **kwargs)
+            return self._request(method, path, token, user_session=user_session, verification_id=verification_id, **kwargs)
         except CorporateError as exc:
             if exc.status_code != 401:
                 raise
         # A 401 is rejected before the server executes a row operation. Never retry network
         # failures, server failures or forbidden operations, which could duplicate writes.
         token = self._token(package, permission, refresh=True)
-        return self._request(method, path, token, user_session=user_session, **kwargs)
+        return self._request(method, path, token, user_session=user_session, verification_id=verification_id, **kwargs)
 
-    def tables(self, package: str, *, user_session: str | None = None) -> list[dict[str, Any]]:
-        result = self._data(package, None, "tables", user_session=user_session)
+    def tables(self, package: str, *, user_session: str | None = None, verification_id: str | None = None) -> list[dict[str, Any]]:
+        result = self._data(package, None, "tables", user_session=user_session, verification_id=verification_id)
         if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
             raise CorporateError("Corporate API returned invalid table metadata")
         return result
@@ -157,7 +170,7 @@ class CorporateClient:
         return count
 
     def read(self, package: str, table: str, *, columns: Sequence[str] | None = None, where: dict[str, Any] | None = None,
-             limit: int | None = None, offset: int = 0, user_session: str | None = None) -> list[dict[str, Any]]:
+             limit: int | None = None, offset: int = 0, user_session: str | None = None, verification_id: str | None = None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"offset": offset}
         if columns is not None:
             payload["columns"] = list(columns)
@@ -165,17 +178,17 @@ class CorporateClient:
             payload["where"] = where
         if limit is not None:
             payload["limit"] = limit
-        return self._row_result(self._data(package, table, "read", payload, user_session=user_session))
+        return self._row_result(self._data(package, table, "read", payload, user_session=user_session, verification_id=verification_id))
 
-    def insert(self, package: str, table: str, rows: Sequence[dict[str, Any]], *, user_session: str | None = None) -> int:
-        return self._count_result(self._data(package, table, "insert", {"rows": list(rows)}, user_session=user_session))
+    def insert(self, package: str, table: str, rows: Sequence[dict[str, Any]], *, user_session: str | None = None, verification_id: str | None = None) -> int:
+        return self._count_result(self._data(package, table, "insert", {"rows": list(rows)}, user_session=user_session, verification_id=verification_id))
 
-    def update(self, package: str, table: str, values: dict[str, Any], where: dict[str, Any], *, user_session: str | None = None) -> int:
+    def update(self, package: str, table: str, values: dict[str, Any], where: dict[str, Any], *, user_session: str | None = None, verification_id: str | None = None) -> int:
         if not values or not where:
             raise ValueError("Update requires values and a nonempty equality filter")
-        return self._count_result(self._data(package, table, "update", {"values": values, "where": where}, user_session=user_session))
+        return self._count_result(self._data(package, table, "update", {"values": values, "where": where}, user_session=user_session, verification_id=verification_id))
 
-    def delete(self, package: str, table: str, where: dict[str, Any], *, user_session: str | None = None) -> int:
+    def delete(self, package: str, table: str, where: dict[str, Any], *, user_session: str | None = None, verification_id: str | None = None) -> int:
         if not where:
             raise ValueError("Delete requires a nonempty equality filter")
-        return self._count_result(self._data(package, table, "delete", {"where": where}, user_session=user_session))
+        return self._count_result(self._data(package, table, "delete", {"where": where}, user_session=user_session, verification_id=verification_id))

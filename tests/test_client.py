@@ -28,7 +28,7 @@ def endpoint():
             self.respond()
         def respond(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("Authorization"), "user_session": self.headers.get("X-Greenhouse-User-Session"), "body": json.loads(body) if body else None})
+            requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("Authorization"), "user_session": self.headers.get("X-Greenhouse-User-Session"), "verification_id": self.headers.get("X-Greenhouse-SDK-Verification"), "sdk_version": self.headers.get("X-Greenhouse-SDK-Version"), "body": json.loads(body) if body else None})
             if self.path.endswith("/access/token"):
                 answer = {"token": f"scope-{len(requests)}", "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                 status = 200
@@ -253,4 +253,25 @@ def test_invalid_user_session_rejected_before_network(endpoint, session):
     with CorporateClient(url, SERVICE) as client:
         with pytest.raises(ValueError):
             client.read("finance", "entries", user_session=session)
+    assert requests == []
+
+
+def test_verification_receipt_only_on_data_and_per_request(endpoint):
+    import uuid
+    url, requests, responses = endpoint
+    identifier = str(uuid.uuid4())
+    with CorporateClient(url, SERVICE) as client:
+        client.read("finance", "entries", verification_id=identifier)
+        client.read("finance", "entries")
+    assert requests[0]["verification_id"] is None and requests[0]["sdk_version"] is None
+    assert requests[1]["verification_id"] == identifier and requests[1]["sdk_version"]
+    assert requests[2]["verification_id"] is None and requests[2]["sdk_version"]
+
+
+@pytest.mark.parametrize("identifier", ["", "forged", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", 123])
+def test_invalid_verification_id_rejected_before_network(endpoint, identifier):
+    url, requests, responses = endpoint
+    with CorporateClient(url, SERVICE) as client:
+        with pytest.raises(ValueError):
+            client.read("finance", "entries", verification_id=identifier)
     assert requests == []

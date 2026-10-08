@@ -16,3 +16,6 @@ class ClientSettings:
 
 # Protocol metadata carries a signed, host-bound app session, never an asserted email.
 USER_SESSION_HEADER = "X-Greenhouse-User-Session"
+
+SDK_VERSION_HEADER = "X-Greenhouse-SDK-Version"
+SDK_VERIFICATION_HEADER = "X-Greenhouse-SDK-Verification"
